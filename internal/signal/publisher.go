@@ -2,7 +2,6 @@ package signal
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,18 +9,16 @@ import (
 	"github.com/wyw14/cry-96/internal/model"
 )
 
-type Publication struct {
-	CycleID    uuid.UUID
-	Generation uint64
-	Published  []uuid.UUID
-	Previous   map[uuid.UUID]model.SignalState
-}
-
-// Publisher applies a convoy signal change with a compensatable record.
+// Publisher applies and rolls back one vessel signal at a time so a partial
+// convoy publication can be resumed or compensated vessel by vessel.
 type Publisher struct {
 	store    *Store
 	recorder *journal.Recorder
 	now      func() time.Time
+	// fault hooks simulate failed field/journal writes. They are only used from
+	// tests; production leaves them nil.
+	writeFault      func(vesselID uuid.UUID, attempt int) error
+	compensateFault func(vesselID uuid.UUID, attempt int) error
 }
 
 func NewPublisher(store *Store, recorder *journal.Recorder, now func() time.Time) *Publisher {
@@ -31,42 +28,56 @@ func NewPublisher(store *Store, recorder *journal.Recorder, now func() time.Time
 	return &Publisher{store: store, recorder: recorder, now: now}
 }
 
-func (p *Publisher) Publish(ctx context.Context, cycle model.TransitCycle, vessels []model.Vessel, aspect model.SignalAspect) (Publication, error) {
-	publication := Publication{
-		CycleID: cycle.ID, Generation: cycle.Generation,
-		Previous: make(map[uuid.UUID]model.SignalState),
-	}
-	for _, vessel := range vessels {
-		if err := ctx.Err(); err != nil {
-			p.Compensate(context.WithoutCancel(ctx), cycle.ChamberID, publication)
-			return publication, err
-		}
-		if previous, ok := p.store.Get(vessel.ID); ok {
-			publication.Previous[vessel.ID] = previous
-		}
-		state := p.store.Set(vessel.ID, cycle.ID, cycle.Generation, aspect, p.now())
-		publication.Published = append(publication.Published, vessel.ID)
-		if _, err := p.recorder.Record(ctx, cycle.ChamberID, model.EventSignalChanged, cycle.ID, cycle.Generation, state); err != nil {
-			p.Compensate(context.WithoutCancel(ctx), cycle.ChamberID, publication)
-			return publication, err
-		}
-	}
-	return publication, nil
+// SetWriteFault installs a fault hook for vessel writes (tests only).
+func (p *Publisher) SetWriteFault(hook func(vesselID uuid.UUID, attempt int) error) {
+	p.writeFault = hook
 }
 
-func (p *Publisher) Compensate(ctx context.Context, chamberID string, publication Publication) error {
-	var combined error
-	for index := len(publication.Published) - 1; index >= 0; index-- {
-		vesselID := publication.Published[index]
-		if previous, ok := publication.Previous[vesselID]; ok {
+// SetCompensateFault installs a fault hook for vessel compensations (tests only).
+func (p *Publisher) SetCompensateFault(hook func(vesselID uuid.UUID, attempt int) error) {
+	p.compensateFault = hook
+}
+
+// WriteVessel publishes one vessel aspect and records the change. The store
+// update only survives when its journal event is appended, so a recorder
+// failure rolls this single vessel back and returns an error. The previous
+// aspect (when one existed) is returned for later compensation.
+func (p *Publisher) WriteVessel(ctx context.Context, chamberID string, vessel model.Vessel, cycleID uuid.UUID, generation uint64, aspect model.SignalAspect, attempt int) (model.SignalState, bool, error) {
+	if p.writeFault != nil {
+		if err := p.writeFault(vessel.ID, attempt); err != nil {
+			return model.SignalState{}, false, err
+		}
+	}
+	previous, hadPrevious := p.store.Get(vessel.ID)
+	state := p.store.Set(vessel.ID, cycleID, generation, aspect, p.now())
+	if _, err := p.recorder.Record(ctx, chamberID, model.EventSignalChanged, cycleID, generation, state); err != nil {
+		// Journal is the durable boundary: undo the in-memory write so a retry
+		// starts from the last durably committed aspect.
+		if hadPrevious {
 			p.store.Set(previous.VesselID, previous.CycleID, previous.Generation, previous.Aspect, p.now())
 		} else {
-			p.store.Remove(vesselID)
+			p.store.Remove(vessel.ID)
 		}
-		_, err := p.recorder.Record(ctx, chamberID, model.EventSignalChanged, publication.CycleID, publication.Generation, map[string]any{
-			"vessel_id": vesselID, "compensated": true,
-		})
-		combined = errors.Join(combined, err)
+		return model.SignalState{}, false, err
 	}
-	return combined
+	return previous, hadPrevious, nil
+}
+
+// CompensateVessel restores one vessel to its previous aspect (or removes it
+// when it had none) and records the compensation marker.
+func (p *Publisher) CompensateVessel(ctx context.Context, chamberID string, vesselID, cycleID uuid.UUID, generation uint64, previous *model.SignalState, attempt int) error {
+	if p.compensateFault != nil {
+		if err := p.compensateFault(vesselID, attempt); err != nil {
+			return err
+		}
+	}
+	if previous != nil {
+		p.store.Set(previous.VesselID, previous.CycleID, previous.Generation, previous.Aspect, p.now())
+	} else {
+		p.store.Remove(vesselID)
+	}
+	_, err := p.recorder.Record(ctx, chamberID, model.EventSignalChanged, cycleID, generation, map[string]any{
+		"vessel_id": vesselID, "compensated": true,
+	})
+	return err
 }

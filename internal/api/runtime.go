@@ -27,6 +27,7 @@ type Runtime struct {
 	Gates           *gate.Controller
 	SignalStore     *signal.Store
 	SignalPublisher *signal.Publisher
+	Publications    *signal.Publications
 	Signals         *signal.Service
 	AdmissionQueue  *admission.Queue
 	Admission       *admission.Service
@@ -68,7 +69,9 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 	leaseService := lease.NewService(leaseRegistry, admissionController, recorder, now)
 	leaseSweeper := lease.NewSweeper(leaseRegistry, now)
 	planner := schedule.NewPlanner(admissionService, recorder, now)
-	scheduleService := schedule.NewService(planner, signalPublisher)
+	signalPublications := signal.NewPublications(signalPublisher, now)
+	scheduleService := schedule.NewService(planner, signalPublications)
+	startPublicationReaper(ctx, scheduleService)
 	ramp := hydraulics.NewRamp(25*time.Millisecond, now)
 	hydraulicsController := hydraulics.NewController(gateCommands, recorder, ramp, now)
 	barrier := safety.NewBarrier()
@@ -109,7 +112,8 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 	return &Runtime{
 		Store: store, Recorder: recorder, GateState: gateState,
 		GateCommands: gateCommands, Gates: gateController,
-		SignalStore: signalStore, SignalPublisher: signalPublisher, Signals: signalService,
+		SignalStore: signalStore, SignalPublisher: signalPublisher,
+		Publications: signalPublications, Signals: signalService,
 		AdmissionQueue: admissionController.Queue(), Admission: admissionService,
 		Planner: planner, Schedule: scheduleService, Hydraulics: hydraulicsController,
 		Interlocks: interlockCoordinator, Cycles: cycleCoordinator, CycleService: cycleService,

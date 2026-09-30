@@ -68,7 +68,7 @@ func (p *Planner) replace(plan model.ConvoyPlan) {
 
 func (p *Planner) Active(chamberID string) []model.ConvoyPlan {
 	p.mu.RLock()
-	var result []model.ConvoyPlan
+	result := make([]model.ConvoyPlan, 0)
 	for _, plan := range p.plans {
 		if plan.ChamberID == chamberID && !plan.Cancelled {
 			result = append(result, plan.Clone())
@@ -76,6 +76,24 @@ func (p *Planner) Active(chamberID string) []model.ConvoyPlan {
 	}
 	p.mu.RUnlock()
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
+	return result
+}
+
+// All returns every plan, including cancelled ones, newest first within a
+// chamber ordering so the operations page can show publication outcomes.
+func (p *Planner) All() []model.ConvoyPlan {
+	p.mu.RLock()
+	result := make([]model.ConvoyPlan, 0, len(p.plans))
+	for _, plan := range p.plans {
+		result = append(result, plan.Clone())
+	}
+	p.mu.RUnlock()
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].ChamberID != result[j].ChamberID {
+			return result[i].ChamberID < result[j].ChamberID
+		}
+		return result[i].CreatedAt.After(result[j].CreatedAt)
+	})
 	return result
 }
 

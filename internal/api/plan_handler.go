@@ -52,13 +52,19 @@ func createPlanHandler(runtime *Runtime) http.HandlerFunc {
 	}
 }
 
+// plansHandler returns every plan (including cancelled ones) alongside their
+// idempotent publication results, so the operations page can render progress.
 func plansHandler(runtime *Runtime) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		result := make(map[string]any, len(runtime.Chambers))
+		active := make(map[string][]model.ConvoyPlan, len(runtime.Chambers))
 		for _, chamberID := range runtime.Chambers {
-			result[chamberID] = runtime.Schedule.Active(chamberID)
+			active[chamberID] = runtime.Schedule.Active(chamberID)
 		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"active":       active,
+			"plans":        runtime.Schedule.All(),
+			"publications": runtime.Schedule.Publications(),
+		})
 	}
 }
 
@@ -74,6 +80,10 @@ func publishSignalsHandler(runtime *Runtime) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, errors.New("plan not found"))
 			return
 		}
+		if plan.Cancelled {
+			writeError(w, http.StatusConflict, errors.New("cancelled convoy plan cannot be published"))
+			return
+		}
 		cycleValue, ok := runtime.Cycles.Current(plan.ChamberID)
 		if !ok {
 			writeError(w, http.StatusConflict, errors.New("active transit not found"))
@@ -81,10 +91,38 @@ func publishSignalsHandler(runtime *Runtime) http.HandlerFunc {
 		}
 		publication, err := runtime.Schedule.Publish(r.Context(), planID, cycleValue)
 		if err != nil {
-			writeError(w, http.StatusConflict, err)
+			switch {
+			case errors.Is(err, signal.ErrPublicationGeneration):
+				writeError(w, http.StatusConflict, err)
+			case errors.Is(err, signal.ErrPublicationCancelled):
+				writeError(w, http.StatusConflict, err)
+			default:
+				writeError(w, http.StatusConflict, err)
+			}
 			return
 		}
-		writeJSON(w, http.StatusAccepted, publication)
+		// Same result for repeated requests; 202 while vessels remain pending.
+		status := http.StatusOK
+		if publication.Status != model.PublicationCompleted {
+			status = http.StatusAccepted
+		}
+		writeJSON(w, status, publication)
+	}
+}
+
+func publicationHandler(runtime *Runtime) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		planID, err := uuid.Parse(chi.URLParam(r, "planID"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		publication, ok := runtime.Schedule.Publication(planID)
+		if !ok {
+			writeError(w, http.StatusNotFound, errors.New("publication not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, publication)
 	}
 }
 
@@ -100,25 +138,21 @@ func cancelPlanHandler(runtime *Runtime) http.HandlerFunc {
 			writeError(w, http.StatusNotFound, errors.New("plan not found"))
 			return
 		}
-		cycleValue, ok := runtime.Cycles.Current(plan.ChamberID)
-		publication := signal.Publication{
-			CycleID: cycleValue.ID, Generation: cycleValue.Generation,
-			Previous: make(map[uuid.UUID]model.SignalState),
-		}
-		if ok {
-			for _, vessel := range plan.Vessels {
-				if _, exists := runtime.SignalStore.Get(vessel.ID); exists {
-					publication.Published = append(publication.Published, vessel.ID)
-				}
-			}
-		}
-		result, err := runtime.Schedule.Cancel(r.Context(), planID, "operator cancellation", publication)
-		if err != nil {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
-		if ok {
+		result, err := runtime.Schedule.Cancel(r.Context(), planID, "operator cancellation")
+		// The plan is already cancelled, so take its own transit cycle terminal
+		// regardless of whether signal compensation finished synchronously.
+		// Guard on plan+identity so a newer transit generation is never touched.
+		if current, isCurrent := runtime.Cycles.Current(plan.ChamberID); isCurrent &&
+			current.PlanID == plan.ID && !current.Stage.Terminal() {
 			_, _ = runtime.Cycles.Cancel(r.Context(), plan.ChamberID, "operator cancellation")
+		}
+		if err != nil {
+			// Compensation is still finishing in the background; the page
+			// polls the publication until it reaches "compensated".
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"cancellation": result, "pending_error": err.Error(),
+			})
+			return
 		}
 		writeJSON(w, http.StatusOK, result)
 	}
